@@ -2,11 +2,11 @@ import os
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from supabase import Client
 
 BASE_DIR = Path(__file__).parent
@@ -15,13 +15,19 @@ app = FastAPI(title="Онлайн доска жалоб и предложени�
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# SUPABASE_KEY = Secret key (sb_secret_...) или legacy service_role JWT.
+# Эти ключи дают полный доступ к БД и обходят RLS, поэтому используются ТОЛЬКО
+# на сервере (Vercel → Environment Variables) и никогда не попадают в браузер.
 _SUPABASE_URL = os.environ.get("SUPABASE_URL")
 _SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+
 supa: Client | None = None
 if _SUPABASE_URL and _SUPABASE_KEY:
-    supa = Client(_SUPABASE_URL, _SUPABASE_KEY)
+    try:
+        supa = Client(_SUPABASE_URL, _SUPABASE_KEY)
+    except Exception:
+        logger.exception("Не удалось инициализировать Supabase клиент")
 
-# Разрешённые значения типа и статуса тикета
 TicketType = Literal["problems", "ideas", "good", "progress"]
 TicketStatus = Literal["problems", "ideas", "good", "progress", "done"]
 
@@ -29,17 +35,42 @@ TicketStatus = Literal["problems", "ideas", "good", "progress", "done"]
 class TicketCreate(BaseModel):
     type: TicketType
     status: TicketType
-    comment: str
-    author: str | None = None
+    comment: str = Field(min_length=1, max_length=1200)
+    author: str | None = Field(default=None, max_length=60)
 
 
 class TicketUpdate(BaseModel):
     type: TicketType | None = None
     status: TicketStatus | None = None
-    comment: str | None = None
-    author: str | None = None
-    resolution_comment: str | None = None
-    resolution_author: str | None = None
+    comment: str | None = Field(default=None, max_length=1200)
+    author: str | None = Field(default=None, max_length=60)
+    resolution_comment: str | None = Field(default=None, max_length=1200)
+    resolution_author: str | None = Field(default=None, max_length=60)
+
+
+def _require_db() -> None:
+    if supa is None:
+        raise HTTPException(
+            status_code=503,
+            detail="База данных не настроена (SUPABASE_URL/SUPABASE_KEY)",
+        )
+
+
+def _run(query: Any) -> Any:
+    """Выполнить запрос Supabase и превратить ошибки в HTTPException."""
+    try:
+        response = query.execute()
+    except Exception as exc:
+        logger.exception("Supabase query failed")
+        raise HTTPException(status_code=502, detail=f"Supabase error: {exc}") from exc
+
+    error = getattr(response, "error", None)
+    if error:
+        message = getattr(error, "message", str(error))
+        logger.error("Supabase returned error: %s", message)
+        raise HTTPException(status_code=502, detail=message)
+
+    return response.data
 
 
 @app.get("/")
@@ -50,186 +81,53 @@ def index():
 
 @app.get("/api/health")
 def health():
-    """Проверка работоспособности бэкенда."""
+    """Проверка работоспособности бэкенда и наличия конфигурации Supabase."""
     return {
         "status": "ok",
-        "supabase_connected": bool(_SUPABASE_URL and _SUPABASE_KEY),
+        "supabase_connected": supa is not None,
     }
 
 
 @app.get("/api/tickets")
 def list_tickets():
-    """Список всех тикетов из Supabase (таблица tickets)."""
-    if supa is None:
-        raise HTTPException(status_code=503, detail="База данных не настроена (SUPABASE_URL/SUPABASE_KEY)")
-    response = supa.table("tickets").select("*").order("id").execute()
-    if response.error:
-        raise HTTPException(status_code=500, detail=response.error.message)
-    return response.data
+    """Список всех тикетов."""
+    _require_db()
+    return _run(supa.table("tickets").select("*").order("id"))
 
 
 @app.post("/api/tickets")
 def create_ticket(payload: TicketCreate):
     """Создание нового тикета."""
-    if supa is None:
-        raise HTTPException(status_code=503, detail="База данных не настроена (SUPABASE_URL/SUPABASE_KEY)")
-    payload_dict = payload.model_dump()
+    _require_db()
     data = {
-        "type": payload_dict["type"],
-        "status": payload_dict["status"],
-        "comment": payload_dict["comment"],
-        "author": payload_dict.get("author") or None,
+        "type": payload.type,
+        "status": payload.status,
+        "comment": payload.comment.strip(),
+        "author": (payload.author or "").strip() or None,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
-    response = supa.table("tickets").insert(data).execute()
-    if response.error:
-        raise HTTPException(status_code=500, detail=response.error.message)
-    return {"id": response.data[0]["id"]}
+    rows = _run(supa.table("tickets").insert(data))
+    if not rows:
+        raise HTTPException(status_code=502, detail="Пустой ответ от Supabase")
+    return rows[0]
 
 
 @app.patch("/api/tickets/{ticket_id}")
 def update_ticket(ticket_id: int, payload: TicketUpdate):
     """Обновление тикета (перемещение по колонкам, решение)."""
-    if supa is None:
-        raise HTTPException(status_code=503, detail="База данных не настроена (SUPABASE_URL/SUPABASE_KEY)")
-    updates = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
-    if updates.get("status") == "done":
-        updates["resolution_comment"] = updates.get("resolution_comment") or ""
-        updates["resolution_author"] = updates.get("resolution_author") or ""
-    response = supa.table("tickets").update(updates).eq("id", ticket_id).execute()
-    if response.error:
-        raise HTTPException(status_code=500, detail=response.error.message)
+    _require_db()
+    updates = {
+        k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None
+    }
+    if not updates:
+        return {"ok": True}
+    _run(supa.table("tickets").update(updates).eq("id", ticket_id))
     return {"ok": True}
 
 
 @app.delete("/api/tickets/{ticket_id}")
 def delete_ticket(ticket_id: int):
     """Удаление тикета."""
-    if supa is None:
-        raise HTTPException(status_code=503, detail="База данных не настроена (SUPABASE_URL/SUPABASE_KEY)")
-    response = supa.table("tickets").delete().eq("id", ticket_id).execute()
-    if response.error:
-        raise HTTPException(status_code=500, detail=response.error.message)
-    return {"ok": True}
-import os
-import logging
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Literal
-
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from supabase import Client
-
-BASE_DIR = Path(__file__).parent
-app = FastAPI(title="Онлайн доска жалоб и предложений команды веба")
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-_SUPABASE_URL = os.environ.get("SUPABASE_URL")
-_SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-supa: Client | None = None
-if _SUPABASE_URL and _SUPABASE_KEY:
-    supa = Client(_SUPABASE_URL, _SUPABASE_KEY)
-
-# Разрешённые значения типа и статуса тикета
-TicketType = Literal["problems", "ideas", "good", "progress"]
-TicketStatus = Literal["problems", "ideas", "good", "progress", "done"]
-
-BASE_DIR = Path(__file__).parent
-app = FastAPI(title="Онлайн доска жалоб и предложений команды веба")
-
-_SUPABASE_URL = os.environ.get("SUPABASE_URL")
-_SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
-supa: Client | None = None
-if _SUPABASE_URL and _SUPABASE_KEY:
-    supa = Client(_SUPABASE_URL, _SUPABASE_KEY)
-
-
-class TicketCreate(BaseModel):
-    type: TicketType
-    status: TicketType
-    comment: str
-    author: str | None = None
-
-
-class TicketUpdate(BaseModel):
-    type: TicketType | None = None
-    status: TicketStatus | None = None
-    comment: str | None = None
-    author: str | None = None
-    resolution_comment: str | None = None
-    resolution_author: str | None = None
-
-
-@app.get("/")
-def index():
-    """Главная страница: одностраничный сайт (SPA)."""
-    return FileResponse(BASE_DIR / "index.html")
-
-
-@app.get("/api/health")
-def health():
-    """Проверка работоспособности бэкенда."""
-    return {
-        "status": "ok",
-        "supabase_connected": bool(_SUPABASE_URL and _SUPABASE_KEY),
-    }
-
-
-@app.get("/api/tickets")
-def list_tickets():
-    """Список всех тикетов из Supabase (таблица tickets)."""
-    if supa is None:
-        raise HTTPException(status_code=503, detail="База данных не настроена (SUPABASE_URL/SUPABASE_KEY)")
-    response = supa.table("tickets").select("*").order("id").execute()
-    if response.error:
-        raise HTTPException(status_code=500, detail=response.error.message)
-    return response.data
-
-
-@app.post("/api/tickets")
-def create_ticket(payload: TicketCreate):
-    """Создание нового тикета."""
-    if supa is None:
-        raise HTTPException(status_code=503, detail="База данных не настроена (SUPABASE_URL/SUPABASE_KEY)")
-    payload_dict = payload.model_dump()
-    data = {
-        "type": payload_dict["type"],
-        "status": payload_dict["status"],
-        "comment": payload_dict["comment"],
-        "author": payload_dict.get("author") or None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
-    response = supa.table("tickets").insert(data).execute()
-    if response.error:
-        raise HTTPException(status_code=500, detail=response.error.message)
-    return {"id": response.data[0]["id"]}
-
-
-@app.patch("/api/tickets/{ticket_id}")
-def update_ticket(ticket_id: int, payload: TicketUpdate):
-    """Обновление тикета (перемещение по колонкам, решение)."""
-    if supa is None:
-        raise HTTPException(status_code=503, detail="База данных не настроена (SUPABASE_URL/SUPABASE_KEY)")
-    updates = {k: v for k, v in payload.model_dump(exclude_unset=True).items() if v is not None}
-    if updates.get("status") == "done":
-        updates["resolution_comment"] = updates.get("resolution_comment") or ""
-        updates["resolution_author"] = updates.get("resolution_author") or ""
-    response = supa.table("tickets").update(updates).eq("id", ticket_id).execute()
-    if response.error:
-        raise HTTPException(status_code=500, detail=response.error.message)
-    return {"ok": True}
-
-
-@app.delete("/api/tickets/{ticket_id}")
-def delete_ticket(ticket_id: int):
-    """Удаление тикета."""
-    if supa is None:
-        raise HTTPException(status_code=503, detail="База данных не настроена (SUPABASE_URL/SUPABASE_KEY)")
-    response = supa.table("tickets").delete().eq("id", ticket_id).execute()
-    if response.error:
-        raise HTTPException(status_code=500, detail=response.error.message)
+    _require_db()
+    _run(supa.table("tickets").delete().eq("id", ticket_id))
     return {"ok": True}

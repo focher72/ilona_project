@@ -518,36 +518,40 @@ h1 .accent{color:var(--blue)}
 </div>
 
 <div class="toast" id="toast"></div>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.58.0"></script>
+
 <script>
-const SUPABASE_URL = 'https://lgtppvqgpaobhcmgunql.supabase.co';
-const SUPABASE_KEY = 'sb_publishable_LAgjOaCT3_eofXEJYlhfGQ_2S2Ew1lx';
-const { createClient } = supabase;
-const db = createClient(SUPABASE_URL, SUPABASE_KEY);
-
 (function(){
-const STORAGE_KEY='teplaya-doska-v1';
-const names={problems:'Проблема',ideas:'Идея',good:'Хорошее'};
-let tickets=[], creatingStatus='problems', dragId=null, nextId=1, resolvingId=null, deletingId=null;
-const $=s=>document.querySelector(s);
-const board=$('#board'), modal=$('#modalBackdrop'), form=$('#ticketForm');
-const confirmBackdrop=$('#confirmBackdrop');
+const names = { problems:'Проблема', ideas:'Идея', good:'Хорошее' };
+let tickets = [];
+let creatingStatus = 'problems';
+let dragId = null;
+let resolvingId = null;
+let deletingId = null;
 
-function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+const $ = s => document.querySelector(s);
+const board = $('#board');
+const modal = $('#modalBackdrop');
+const form  = $('#ticketForm');
+const confirmBackdrop = $('#confirmBackdrop');
 
-function toast(s,type){
-  const el=$('#toast');
-  el.textContent=s;
-  el.classList.toggle('toast-danger',type==='danger');
-  el.classList.add('show');
-  clearTimeout(el._t);
-  el._t=setTimeout(()=>el.classList.remove('show'),2400);
+/* ===== API (всё через FastAPI) ===== */
+async function api(path, options) {
+  const r = await fetch(path, options);
+  let body = null;
+  try { body = await r.json(); } catch(_) {}
+  if (!r.ok) {
+    const msg = (body && (body.detail || body.message)) || r.statusText || ('HTTP ' + r.status);
+    throw new Error(msg);
+  }
+  return body;
 }
+const apiList   = ()         => api('/api/tickets');
+const apiCreate = (data)     => api('/api/tickets',     { method:'POST',   headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+const apiUpdate = (id, data) => api('/api/tickets/'+id, { method:'PATCH',  headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+const apiDelete = (id)       => api('/api/tickets/'+id, { method:'DELETE' });
 
-async function load() {
-  const { data, error } = await db.from('tickets').select('*').order('id');
-  if (error) { console.error('load error:', error); toast('Не удалось загрузить записи: '+error.message,'danger'); return; }
-  tickets = (data || []).map(t => ({
+function normalize(t){
+  return {
     id: t.id,
     type: t.type,
     status: t.status,
@@ -556,288 +560,333 @@ async function load() {
     createdAt: t.created_at,
     resolutionComment: t.resolution_comment,
     resolutionAuthor: t.resolution_author
-  }));
-  nextId = tickets.reduce((m, t) => Math.max(m, t.id), 0) + 1;
-  render();
+  };
 }
 
-async function saveTicket(t) {
-  const { error } = await db.from('tickets').upsert({
-    id: t.id,
-    type: t.type,
-    status: t.status,
-    comment: t.comment,
-    author: t.author || null,
-    created_at: t.createdAt,
-    resolution_comment: t.resolutionComment || null,
-    resolution_author: t.resolutionAuthor || null
-  });
-  if (error) {
-    console.error('saveTicket error:', error);
-    toast('Не удалось сохранить: '+error.message,'danger');
-  }
-}
-
-async function deleteTicket(id) {
-  const { error } = await db.from('tickets').delete().eq('id', id);
-  if (error) {
-    console.error('deleteTicket error:', error);
-    toast('Не удалось удалить: '+error.message,'danger');
-    return;
-  }
-  toast('Запись удалена', 'danger');
-}
-
-// Анонимный вход + запуск
-async function init() {
+async function load(){
   try {
-    const { data: { session } } = await db.auth.getSession();
-    if (!session) await db.auth.signInAnonymously();
-  } catch (e) {
-    console.warn('Auth error (продолжаем без анонимного входа):', e);
+    const data = await apiList();
+    tickets = (data || []).map(normalize);
+    render();
+  } catch(e){
+    console.error('load error:', e);
+    toast('Не удалось загрузить записи: ' + e.message, 'danger');
+  }
+}
+
+/* ===== UI helpers ===== */
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+function toast(s, type){
+  const el = $('#toast');
+  el.textContent = s;
+  el.classList.toggle('toast-danger', type === 'danger');
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2400);
+}
+
+function dateLabel(iso){
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleDateString('ru-RU', { day:'numeric', month:'short' });
+}
+
+/* ===== Cards ===== */
+function card(t){
+  const el = document.createElement('article');
+  el.className = 'ticket';
+  el.dataset.id = t.id;
+
+  const isDone = t.status === 'done';
+
+  if (isDone){
+    el.classList.add('locked');
+    el.draggable = false;
+  } else {
+    el.draggable = true;
+    el.addEventListener('dragstart', e => {
+      dragId = t.id;
+      el.classList.add('dragging');
+      e.dataTransfer.setData('text/plain', String(t.id));
+      e.dataTransfer.effectAllowed = 'move';
+    });
+    el.addEventListener('dragend', () => {
+      dragId = null;
+      el.classList.remove('dragging');
+      document.querySelectorAll('.column').forEach(c => c.classList.remove('drop-target'));
+    });
   }
 
-  db.channel('tickets-channel')
-    .on('postgres_changes', { event: '*', schema: 'public', table: 'tickets' }, () => load())
-    .subscribe();
+  const bottomLeft = isDone
+    ? `<div class="ticket-bottom-left"><span class="date">${dateLabel(t.createdAt)}</span><span class="done-badge">Решено</span></div>`
+    : `<div class="ticket-bottom-left"><span class="date">${dateLabel(t.createdAt)}</span><button class="move" type="button">Переместить →</button></div>`;
 
-  load();
-}
-init();
+  el.innerHTML = `
+    <div class="ticket-top">
+      <span class="kind">${escapeHtml(names[t.type] || 'Запись')}</span>
+      <span class="id">#${String(t.id).padStart(3,'0')}</span>
+    </div>
+    <div class="comment">${escapeHtml(t.comment)}</div>
+    <div class="author">${t.author ? `✍ ${escapeHtml(t.author)}` : '◌ Анонимно'}</div>
+    ${t.resolutionComment ? `<div style="margin-top:12px;padding:10px 12px;background:#f2f4fe;border-radius:14px;font-size:12px;font-weight:600"><strong style="color:#3760f9">Как решили</strong><div style="margin-top:4px;white-space:pre-wrap">${escapeHtml(t.resolutionComment)}</div>${t.resolutionAuthor ? `<div style="margin-top:6px;color:#86868b">✍ ${escapeHtml(t.resolutionAuthor)}</div>` : ''}</div>` : ''}
+    <div class="ticket-bottom">
+      ${bottomLeft}
+      <button class="delete-btn" type="button" title="Удалить запись" aria-label="Удалить запись">×</button>
+    </div>`;
 
-function dateLabel(iso){const d=new Date(iso);return d.toLocaleDateString('ru-RU',{day:'numeric',month:'short'})}
-
-function card(t){
- const el=document.createElement('article');
- el.className='ticket';el.dataset.id=t.id;
-
- // решённые тикеты "заморожены": без drag и без кнопки перемещения
- const isDone = t.status === 'done';
-
- if(isDone){
-   el.classList.add('locked');
-   el.draggable = false;
- } else {
-   el.draggable = true;
-   el.addEventListener('dragstart',e=>{dragId=t.id;el.classList.add('dragging');e.dataTransfer.setData('text/plain',String(t.id));e.dataTransfer.effectAllowed='move'});
-   el.addEventListener('dragend',()=>{dragId=null;el.classList.remove('dragging');document.querySelectorAll('.column').forEach(c=>c.classList.remove('drop-target'))});
- }
-
- const bottomLeft = isDone
-   ? `<div class="ticket-bottom-left"><span class="date">${dateLabel(t.createdAt)}</span><span class="done-badge">Решено</span></div>`
-   : `<div class="ticket-bottom-left"><span class="date">${dateLabel(t.createdAt)}</span><button class="move" type="button">Переместить →</button></div>`;
-
- el.innerHTML=`
-   <div class="ticket-top">
-     <span class="kind">${escapeHtml(names[t.type]||'Запись')}</span>
-     <span class="id">#${String(t.id).padStart(3,'0')}</span>
-   </div>
-   <div class="comment">${escapeHtml(t.comment)}</div>
-   <div class="author">${t.author?`✍ ${escapeHtml(t.author)}`:'◌ Анонимно'}</div>
-   ${t.resolutionComment?`<div style="margin-top:12px;padding:10px 12px;background:#f2f4fe;border-radius:14px;font-size:12px;font-weight:600"><strong style="color:#3760f9">Как решили</strong><div style="margin-top:4px;white-space:pre-wrap">${escapeHtml(t.resolutionComment)}</div>${t.resolutionAuthor?`<div style="margin-top:6px;color:#86868b">✍ ${escapeHtml(t.resolutionAuthor)}</div>`:''}</div>`:''}
-   <div class="ticket-bottom">
-     ${bottomLeft}
-     <button class="delete-btn" type="button" title="Удалить запись" aria-label="Удалить запись">×</button>
-   </div>`;
-
- if(!isDone){
-   el.querySelector('.move').addEventListener('click',()=>moveNext(t));
- }
- el.querySelector('.delete-btn').addEventListener('click',e=>{e.stopPropagation();askDelete(t.id,el)});
- return el;
+  if (!isDone){
+    el.querySelector('.move').addEventListener('click', () => moveNext(t));
+  }
+  el.querySelector('.delete-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    askDelete(t.id, el);
+  });
+  return el;
 }
 
 function render(){
- document.querySelectorAll('.column').forEach(col=>{
-   const status=col.dataset.status, area=col.querySelector('.cards');
-   area.innerHTML='';
-   const subset=tickets.filter(t=>t.status===status);
-   col.querySelector('.count').textContent=subset.length;
-   if(!subset.length){
-     const empty=document.createElement('div');
-     empty.className='empty';
-     empty.textContent=status==='progress'?'Тут появятся карточки в работе':status==='done'?'Пока ничего не решено':'Пока пусто — начните разговор';
-     area.appendChild(empty);
-   }
-   subset.forEach(t=>area.appendChild(card(t)));
- });
- $('#totalCount').textContent=`${tickets.length} ${tickets.length===1?'запись':tickets.length>1&&tickets.length<5?'записи':'записей'}`;
+  document.querySelectorAll('.column').forEach(col => {
+    const status = col.dataset.status;
+    const area = col.querySelector('.cards');
+    area.innerHTML = '';
+    const subset = tickets.filter(t => t.status === status);
+    col.querySelector('.count').textContent = subset.length;
+    if (!subset.length){
+      const empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = status === 'progress'
+        ? 'Тут появятся карточки в работе'
+        : status === 'done'
+          ? 'Пока ничего не решено'
+          : 'Пока пусто — начните разговор';
+      area.appendChild(empty);
+    }
+    subset.forEach(t => area.appendChild(card(t)));
+  });
+  $('#totalCount').textContent = `${tickets.length} ${
+    tickets.length === 1 ? 'запись' :
+    (tickets.length > 1 && tickets.length < 5) ? 'записи' : 'записей'
+  }`;
 }
 
+/* ===== Modals ===== */
 function openModal(status){
- resolvingId=null;creatingStatus=status;
- const title=status==='ideas'?'Новая идея':status==='good'?'Поделиться хорошим':'Сообщить о проблеме';
- $('#modalTitle').innerHTML='<span class="dotmark"></span>'+title;
- $('#modalIntro').textContent=status==='ideas'?'Оставьте идею на стикере — подпись по желанию.':'Напишите комментарий. Подписываться необязательно.';
- $('#commentLabel').innerHTML=(status==='ideas'?'Текст стикера':'Комментарий')+' <small>— обязательное поле</small>';
- $('#comment').value='';
- $('#author').value='';
- $('#authorField').style.display='block';
- $('#comment').required=true;
- $('#commentError').style.display='none';
- modal.classList.add('open');
- setTimeout(()=>$('#comment').focus(),40);
+  resolvingId = null;
+  creatingStatus = status;
+  const title = status === 'ideas' ? 'Новая идея' : status === 'good' ? 'Поделиться хорошим' : 'Сообщить о проблеме';
+  $('#modalTitle').innerHTML = '<span class="dotmark"></span>' + title;
+  $('#modalIntro').textContent = status === 'ideas'
+    ? 'Оставьте идею на стикере — подпись по желанию.'
+    : 'Напишите комментарий. Подписываться необязательно.';
+  $('#commentLabel').innerHTML = (status === 'ideas' ? 'Текст стикера' : 'Комментарий') + ' <small>— обязательное поле</small>';
+  $('#comment').value = '';
+  $('#comment').placeholder = 'Что хочется рассказать?';
+  $('#comment').required = true;
+  $('#author').value = '';
+  $('#author').placeholder = 'Оставьте пустым для анонимности';
+  $('#authorField').style.display = 'block';
+  $('#commentError').style.display = 'none';
+  modal.classList.add('open');
+  setTimeout(() => $('#comment').focus(), 40);
 }
-function closeModal(){modal.classList.remove('open');resolvingId=null}
+function closeModal(){
+  modal.classList.remove('open');
+  resolvingId = null;
+}
 
 function askResolution(id){
- const t=tickets.find(x=>x.id===id);if(!t)return;
- resolvingId=id;creatingStatus='done';
- $('#modalTitle').innerHTML='<span class="dotmark"></span>Решение тикета';
- $('#modalIntro').textContent='Расскажите, что сделали, чтобы решить проблему. Можно оставить пояснение без подписи.';
- $('#commentLabel').innerHTML='Комментарий о решении <small>— необязательно</small>';
- $('#comment').value='';
- $('#comment').placeholder='Что удалось сделать? Какой результат?';
- $('#comment').required=false;
- $('#author').value='';
- $('#author').placeholder='Кто решил проблему? (необязательно)';
- $('#authorField').style.display='block';
- $('#commentError').style.display='none';
- modal.classList.add('open');
- setTimeout(()=>$('#comment').focus(),40);
+  const t = tickets.find(x => x.id === id);
+  if (!t) return;
+  resolvingId = id;
+  creatingStatus = 'done';
+  $('#modalTitle').innerHTML = '<span class="dotmark"></span>Решение тикета';
+  $('#modalIntro').textContent = 'Расскажите, что сделали, чтобы решить проблему. Можно оставить пояснение без подписи.';
+  $('#commentLabel').innerHTML = 'Комментарий о решении <small>— необязательно</small>';
+  $('#comment').value = '';
+  $('#comment').placeholder = 'Что удалось сделать? Какой результат?';
+  $('#comment').required = false;
+  $('#author').value = '';
+  $('#author').placeholder = 'Кто решил проблему? (необязательно)';
+  $('#authorField').style.display = 'block';
+  $('#commentError').style.display = 'none';
+  modal.classList.add('open');
+  setTimeout(() => $('#comment').focus(), 40);
 }
 
-function moveTicket(id,status){
- const t=tickets.find(x=>x.id===id);if(!t)return;
+/* ===== Move / Resolve ===== */
+async function moveTicket(id, status){
+  const t = tickets.find(x => x.id === id);
+  if (!t) return;
 
- // из «Решено» тикет никуда не перемещается
- if(t.status==='done'){
-   toast('Решённые записи остаются в колонке «Решено».');
-   return;
- }
- // в «Решено» кладём только из problems/ideas/progress
- if(status==='done' && !['problems','ideas','progress'].includes(t.status)){
-   toast('Эту запись нельзя перенести в «Решено».');
-   return;
- }
- // «На решении» — только проблемы и идеи
- if(status==='progress' && !['problems','ideas'].includes(t.type) && t.status!=='progress'){
-   toast('В работу можно перемещать проблемы и идеи.');
-   return;
- }
- if(status==='progress' && !['problems','ideas'].includes(t.type)){toast('В работу можно перемещать проблемы и идеи.');return}
- if(status==='done' && !['problems','ideas','progress'].includes(t.type)){toast('Эту запись нельзя перенести в «Решено».');return}
+  if (t.status === 'done'){ toast('Решённые записи остаются в колонке «Решено».'); return; }
+  if (status === 'done' && !['problems','ideas','progress'].includes(t.status)){
+    toast('Эту запись нельзя перенести в «Решено».'); return;
+  }
+  if (status === 'progress' && !['problems','ideas'].includes(t.type)){
+    toast('В работу можно перемещать проблемы и идеи.'); return;
+  }
+  if (status === 'done' && !['problems','ideas','progress'].includes(t.type)){
+    toast('Эту запись нельзя перенести в «Решено».'); return;
+  }
+  if (status === 'done' && t.status !== 'done'){ askResolution(id); return; }
 
- if(status==='done' && t.status!=='done'){askResolution(id);return}
- t.status=status;
- saveTicket(t);
- render();
- toast(status==='progress'?'Перемещено в «На решении»':status==='done'?'Отмечено как решённое':'Карточка перемещена');
+  try {
+    await apiUpdate(id, { status });
+    await load();
+    toast(status === 'progress' ? 'Перемещено в «На решении»' : 'Карточка перемещена');
+  } catch (err){
+    toast('Не удалось переместить: ' + err.message, 'danger');
+  }
 }
+
 function moveNext(t){
- if(t.status==='done'){return}
- const order=t.status==='problems'||t.status==='ideas'?['progress','done']:t.status==='progress'?['done']:[];
- const next=order[0];
- if(next)moveTicket(t.id,next);
+  if (t.status === 'done') return;
+  const order = (t.status === 'problems' || t.status === 'ideas')
+    ? ['progress','done']
+    : t.status === 'progress' ? ['done'] : [];
+  const next = order[0];
+  if (next) moveTicket(t.id, next);
 }
 
-/* ===== УДАЛЕНИЕ ===== */
-function askDelete(id,el){
- const t=tickets.find(x=>x.id===id);if(!t)return;
- deletingId=id;
- const preview=t.comment.length>90?t.comment.slice(0,90).trim()+'…':t.comment;
- $('#confirmText').innerHTML=`Запись <b>#${String(t.id).padStart(3,'0')}</b> будет удалена навсегда.<br><span style="opacity:.85;font-style:italic;display:inline-block;margin-top:8px;color:#5b5b62">«${escapeHtml(preview)}»</span>`;
- confirmBackdrop.classList.add('open');
- confirmBackdrop._el = el;
+/* ===== Delete ===== */
+function askDelete(id, el){
+  const t = tickets.find(x => x.id === id);
+  if (!t) return;
+  deletingId = id;
+  const preview = t.comment.length > 90 ? t.comment.slice(0, 90).trim() + '…' : t.comment;
+  $('#confirmText').innerHTML = `Запись <b>#${String(t.id).padStart(3,'0')}</b> будет удалена навсегда.<br><span style="opacity:.85;font-style:italic;display:inline-block;margin-top:8px;color:#5b5b62">«${escapeHtml(preview)}»</span>`;
+  confirmBackdrop.classList.add('open');
+  confirmBackdrop._el = el;
 }
-function closeConfirm(){confirmBackdrop.classList.remove('open');deletingId=null;confirmBackdrop._el=null}
-function doDelete(){
- if(deletingId===null)return;
- const id=deletingId;
- const el=confirmBackdrop._el;
- const t=tickets.find(x=>x.id===id);
- closeConfirm();
- if(!t)return;
- if(el){
-   el.classList.add('removing');
-   setTimeout(()=>{
-     tickets=tickets.filter(x=>x.id!==id);
-     deleteTicket(id);
-     render();
-   },280);
- }else{
-   tickets=tickets.filter(x=>x.id!==id);
-   deleteTicket(id);
-   render();
- }
+function closeConfirm(){
+  confirmBackdrop.classList.remove('open');
+  deletingId = null;
+  confirmBackdrop._el = null;
 }
 
-/* ===== EVENTS ===== */
-$('#board').addEventListener('click',e=>{const b=e.target.closest('[data-create]');if(b)openModal(b.dataset.create)});
-$('#cancelBtn').addEventListener('click',closeModal);
-modal.addEventListener('click',e=>{if(e.target===modal)closeModal()});
-$('#confirmCancel').addEventListener('click',closeConfirm);
-$('#confirmDelete').addEventListener('click',doDelete);
-confirmBackdrop.addEventListener('click',e=>{if(e.target===confirmBackdrop)closeConfirm()});
-document.addEventListener('keydown',e=>{
-  if(e.key==='Escape'){
-    if(confirmBackdrop.classList.contains('open'))closeConfirm();
+async function doDelete(){
+  if (deletingId === null) return;
+  const id = deletingId;
+  const el = confirmBackdrop._el;
+  closeConfirm();
+  try {
+    await apiDelete(id);
+    tickets = tickets.filter(x => x.id !== id);
+    if (el){
+      el.classList.add('removing');
+      setTimeout(() => { render(); toast('Запись удалена', 'danger'); }, 280);
+    } else {
+      render();
+      toast('Запись удалена', 'danger');
+    }
+  } catch (err){
+    toast('Не удалось удалить: ' + err.message, 'danger');
+  }
+}
+
+/* ===== Events ===== */
+$('#board').addEventListener('click', e => {
+  const b = e.target.closest('[data-create]');
+  if (b) openModal(b.dataset.create);
+});
+$('#cancelBtn').addEventListener('click', closeModal);
+modal.addEventListener('click', e => { if (e.target === modal) closeModal(); });
+$('#confirmCancel').addEventListener('click', closeConfirm);
+$('#confirmDelete').addEventListener('click', doDelete);
+confirmBackdrop.addEventListener('click', e => { if (e.target === confirmBackdrop) closeConfirm(); });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape'){
+    if (confirmBackdrop.classList.contains('open')) closeConfirm();
     else closeModal();
   }
-  if(e.key==='Enter'&&confirmBackdrop.classList.contains('open')){e.preventDefault();doDelete()}
+  if (e.key === 'Enter' && confirmBackdrop.classList.contains('open')){
+    e.preventDefault();
+    doDelete();
+  }
 });
 
-form.addEventListener('submit',e=>{
- e.preventDefault();
- const comment=$('#comment').value.trim();
- if(resolvingId!==null){
-   const t=tickets.find(x=>x.id===resolvingId);if(!t)return;
-   t.status='done';
-   t.resolutionComment=comment;
-   t.resolutionAuthor=$('#author').value.trim();
-   t.resolvedAt=new Date().toISOString();
-   saveTicket(t);
-   render();
-   closeModal();
-   $('#comment').required=true;
-   $('#comment').placeholder='Что хочется рассказать?';
-   $('#author').placeholder='Оставьте пустым для анонимности';
-   toast('Решение сохранено');
-   return;
- }
- if(!comment){$('#commentError').style.display='block';$('#comment').focus();return}
- const newTicket = {
-   id: nextId++,
-   type: creatingStatus,
-   status: creatingStatus,
-   comment: comment,
-   author: $('#author').value.trim(),
-   createdAt: new Date().toISOString()
- };
- tickets.unshift(newTicket);
- saveTicket(newTicket);
- render();
- closeModal();
- $('#comment').placeholder='Что хочется рассказать?';
- $('#author').placeholder='Оставьте пустым для анонимности';
- toast('Запись добавлена на доску');
+form.addEventListener('submit', async e => {
+  e.preventDefault();
+  const comment = $('#comment').value.trim();
+
+  if (resolvingId !== null){
+    try {
+      await apiUpdate(resolvingId, {
+        status: 'done',
+        resolution_comment: comment,
+        resolution_author: $('#author').value.trim()
+      });
+      await load();
+      closeModal();
+      toast('Решение сохранено');
+    } catch (err){
+      toast('Не удалось сохранить решение: ' + err.message, 'danger');
+    }
+    return;
+  }
+
+  if (!comment){
+    $('#commentError').style.display = 'block';
+    $('#comment').focus();
+    return;
+  }
+
+  try {
+    await apiCreate({
+      type: creatingStatus,
+      status: creatingStatus,
+      comment,
+      author: $('#author').value.trim() || null
+    });
+    await load();
+    closeModal();
+    toast('Запись добавлена на доску');
+  } catch (err){
+    toast('Не удалось создать: ' + err.message, 'danger');
+  }
 });
 
-document.querySelectorAll('.column').forEach(col=>{
- const isDoneCol = col.dataset.status === 'done';
+document.querySelectorAll('.column').forEach(col => {
+  const isDoneCol = col.dataset.status === 'done';
 
- col.addEventListener('dragover',e=>{
-   // колонка «Решено» больше не принимает drag
-   if(isDoneCol) return;
-   e.preventDefault();
-   col.classList.add('drop-target');
-   e.dataTransfer.dropEffect='move';
- });
- col.addEventListener('dragleave',e=>{if(!col.contains(e.relatedTarget))col.classList.remove('drop-target')});
- col.addEventListener('drop',e=>{
-   if(isDoneCol) return;
-   e.preventDefault();
-   col.classList.remove('drop-target');
-   const id=Number(e.dataTransfer.getData('text/plain'))||dragId;
-   if(!id)return;
-   const status=col.dataset.status;
-   if(status==='problems'||status==='ideas'||status==='good'){
-     const t=tickets.find(x=>x.id===id);
-     if(t&&t.status!==status){toast('Новые записи создаются через кнопки в первых трёх колонках.');return}
-   }
-   moveTicket(id,status);
- });
+  col.addEventListener('dragover', e => {
+    if (isDoneCol) return;
+    e.preventDefault();
+    col.classList.add('drop-target');
+    e.dataTransfer.dropEffect = 'move';
+  });
+  col.addEventListener('dragleave', e => {
+    if (!col.contains(e.relatedTarget)) col.classList.remove('drop-target');
+  });
+  col.addEventListener('drop', e => {
+    if (isDoneCol) return;
+    e.preventDefault();
+    col.classList.remove('drop-target');
+    const id = Number(e.dataTransfer.getData('text/plain')) || dragId;
+    if (!id) return;
+    const status = col.dataset.status;
+    if (status === 'problems' || status === 'ideas' || status === 'good'){
+      const t = tickets.find(x => x.id === id);
+      if (t && t.status !== status){
+        toast('Новые записи создаются через кнопки в первых трёх колонках.');
+        return;
+      }
+    }
+    moveTicket(id, status);
+  });
 });
+
+/* ===== INIT + polling ===== */
+async function pollTick(){
+  if (modal.classList.contains('open')) return;
+  if (confirmBackdrop.classList.contains('open')) return;
+  if (dragId !== null) return;
+  await load();
+}
+
+load();
+setInterval(pollTick, 5000);
 })();
 </script>
 </body>
