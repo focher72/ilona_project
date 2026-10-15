@@ -480,7 +480,7 @@ h1 .accent{color:var(--blue)}
     </section>
   </main>
 
-  <div class="footer">Карточки сохраняются в этом браузере на вашем устройстве.</div>
+  <div class="footer">Карточки сохраняются в базе данных и доступны всем участникам.</div>
 </div>
 
 <!-- Модалка создания -->
@@ -518,12 +518,13 @@ h1 .accent{color:var(--blue)}
 </div>
 
 <div class="toast" id="toast"></div>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.58.0"></script>
 <script>
 const SUPABASE_URL = 'https://lgtppvqgpaobhcmgunql.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_LAgjOaCT3_eofXEJYlhfGQ_2S2Ew1lx';
 const { createClient } = supabase;
 const db = createClient(SUPABASE_URL, SUPABASE_KEY);
+
 (function(){
 const STORAGE_KEY='teplaya-doska-v1';
 const names={problems:'Проблема',ideas:'Идея',good:'Хорошее'};
@@ -532,9 +533,20 @@ const $=s=>document.querySelector(s);
 const board=$('#board'), modal=$('#modalBackdrop'), form=$('#ticketForm');
 const confirmBackdrop=$('#confirmBackdrop');
 
+function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+function toast(s,type){
+  const el=$('#toast');
+  el.textContent=s;
+  el.classList.toggle('toast-danger',type==='danger');
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t=setTimeout(()=>el.classList.remove('show'),2400);
+}
+
 async function load() {
   const { data, error } = await db.from('tickets').select('*').order('id');
-  if (error) { console.error(error); return; }
+  if (error) { console.error('load error:', error); toast('Не удалось загрузить записи: '+error.message,'danger'); return; }
   tickets = (data || []).map(t => ({
     id: t.id,
     type: t.type,
@@ -548,34 +560,42 @@ async function load() {
   nextId = tickets.reduce((m, t) => Math.max(m, t.id), 0) + 1;
   render();
 }
+
 async function saveTicket(t) {
-  await db.from('tickets').upsert({
-    id: t.id, type: t.type, status: t.status,
-    comment: t.comment, author: t.author || null,
+  const { error } = await db.from('tickets').upsert({
+    id: t.id,
+    type: t.type,
+    status: t.status,
+    comment: t.comment,
+    author: t.author || null,
     created_at: t.createdAt,
     resolution_comment: t.resolutionComment || null,
     resolution_author: t.resolutionAuthor || null
   });
+  if (error) {
+    console.error('saveTicket error:', error);
+    toast('Не удалось сохранить: '+error.message,'danger');
+  }
 }
-function escapeHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function toast(s,type){
-  const el=$('#toast');
-  el.textContent=s;
-  el.classList.toggle('toast-danger',type==='danger');
-  el.classList.add('show');
-  clearTimeout(el._t);
-  el._t=setTimeout(()=>el.classList.remove('show'),2400);
-}
-// Удаление
+
 async function deleteTicket(id) {
-  await db.from('tickets').delete().eq('id', id);
+  const { error } = await db.from('tickets').delete().eq('id', id);
+  if (error) {
+    console.error('deleteTicket error:', error);
+    toast('Не удалось удалить: '+error.message,'danger');
+    return;
+  }
   toast('Запись удалена', 'danger');
 }
 
 // Анонимный вход + запуск
 async function init() {
-  const { data: { session } } = await db.auth.getSession();
-  if (!session) await db.auth.signInAnonymously();
+  try {
+    const { data: { session } } = await db.auth.getSession();
+    if (!session) await db.auth.signInAnonymously();
+  } catch (e) {
+    console.warn('Auth error (продолжаем без анонимного входа):', e);
+  }
 
   db.channel('tickets-channel')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'tickets' }, () => load())
@@ -584,6 +604,7 @@ async function init() {
   load();
 }
 init();
+
 function dateLabel(iso){const d=new Date(iso);return d.toLocaleDateString('ru-RU',{day:'numeric',month:'short'})}
 
 function card(t){
@@ -698,7 +719,9 @@ function moveTicket(id,status){
  if(status==='done' && !['problems','ideas','progress'].includes(t.type)){toast('Эту запись нельзя перенести в «Решено».');return}
 
  if(status==='done' && t.status!=='done'){askResolution(id);return}
- t.status=status;save();render();
+ t.status=status;
+ saveTicket(t);
+ render();
  toast(status==='progress'?'Перемещено в «На решении»':status==='done'?'Отмечено как решённое':'Карточка перемещена');
 }
 function moveNext(t){
@@ -729,13 +752,13 @@ function doDelete(){
    el.classList.add('removing');
    setTimeout(()=>{
      tickets=tickets.filter(x=>x.id!==id);
-     save();render();
-     toast('Запись удалена','danger');
+     deleteTicket(id);
+     render();
    },280);
  }else{
    tickets=tickets.filter(x=>x.id!==id);
-   save();render();
-   toast('Запись удалена','danger');
+   deleteTicket(id);
+   render();
  }
 }
 
@@ -763,15 +786,28 @@ form.addEventListener('submit',e=>{
    t.resolutionComment=comment;
    t.resolutionAuthor=$('#author').value.trim();
    t.resolvedAt=new Date().toISOString();
-   save();render();closeModal();
+   saveTicket(t);
+   render();
+   closeModal();
    $('#comment').required=true;
    $('#comment').placeholder='Что хочется рассказать?';
    $('#author').placeholder='Оставьте пустым для анонимности';
-   toast('Решение сохранено');return;
+   toast('Решение сохранено');
+   return;
  }
  if(!comment){$('#commentError').style.display='block';$('#comment').focus();return}
- tickets.unshift({id:nextId++,type:creatingStatus,status:creatingStatus,comment,author:$('#author').value.trim(),createdAt:new Date().toISOString()});
- save();render();closeModal();
+ const newTicket = {
+   id: nextId++,
+   type: creatingStatus,
+   status: creatingStatus,
+   comment: comment,
+   author: $('#author').value.trim(),
+   createdAt: new Date().toISOString()
+ };
+ tickets.unshift(newTicket);
+ saveTicket(newTicket);
+ render();
+ closeModal();
  $('#comment').placeholder='Что хочется рассказать?';
  $('#author').placeholder='Оставьте пустым для анонимности';
  toast('Запись добавлена на доску');
@@ -802,8 +838,6 @@ document.querySelectorAll('.column').forEach(col=>{
    moveTicket(id,status);
  });
 });
-
-load();render();
 })();
 </script>
 </body>
